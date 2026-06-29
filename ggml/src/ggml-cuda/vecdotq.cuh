@@ -103,6 +103,21 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     return s * 0x01010101;
 }
 
+// dp4a of the conditionally-negated grid ((g ^ s) - s) with u, accumulated
+// into acc. Used by the IQ2/IQ3 vec-dot kernels where s is a per-byte 0x00/0xFF
+// sign mask from __vcmpne4. On GCN5 the packed byte subtract is folded into a
+// second native sdot4 (GCN5 has no packed byte subtract):
+//   dp4a((g^s) - s, u, acc) == dp4a(g^s, u, acc) - dp4a(s, u, 0)
+// Exact because every IQ grid byte is small (<=62), so the negate cannot
+// saturate.
+static __device__ __forceinline__ int dp4a_condneg(const int g, const int s, const int u, const int acc) {
+#if defined(__gfx906__)
+    return ggml_cuda_dp4a(g ^ s, u, acc) - ggml_cuda_dp4a(s, u, 0);
+#else
+    return ggml_cuda_dp4a(__vsub4(g ^ s, s), u, acc);
+#endif
+}
+
 // VDR = vec dot ratio, how many contiguous integers each thread processes when the vec dot kernel is called
 // MMVQ = mul_mat_vec_q, MMQ = mul_mat_q
 
@@ -468,9 +483,18 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmvq(
 
         const int vih = ((vh >> i) << 2) & 0x04040404;
 
+#if defined(__gfx906__)
+        // GCN5 has no packed byte subtract, so fold vil - vih into two native
+        // sdot4 via dp4a linearity:
+        //   dp4a(vil - vih, u) == dp4a(vil, u) - dp4a(vih, u)
+        // vil bytes are 0..3 and vih bytes are 0 or 4, so vil - vih is in
+        // [-4, 3] and cannot saturate.
+        const int sumi = ggml_cuda_dp4a(vil, u[i], 0) - ggml_cuda_dp4a(vih, u[i], 0);
+#else
         const int vi = __vsubss4(vil, vih);
-
-        sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
+        const int sumi = ggml_cuda_dp4a(vi, u[i], 0);
+#endif
+        sumf += d8[i] * (sumi * sc); // SIMD dot product
     }
 
     return d3 * sumf;
@@ -635,9 +659,18 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
 
         const int vih = ((vh >> (4*i)) << 4) & 0x30303030;
 
-        const int vi = __vsubss4((vil | vih), 0x20202020); // vi = (vil | vih) - 32
-
-        sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
+#if defined(__gfx906__)
+        // GCN5 has no packed byte subtract, so fold the -32 into a second native
+        // sdot4 via dp4a linearity:
+        //   dp4a(v - 0x20, u) == dp4a(v, u) - dp4a(0x20202020, u)
+        // (vil | vih) bytes are 0..63, so the subtract cannot saturate.
+        const int sumi = ggml_cuda_dp4a(vil | vih, u[i], 0)
+                       - ggml_cuda_dp4a(0x20202020, u[i], 0);
+#else
+        const int vi = __vsubss4((vil | vih), 0x20202020); // (vil | vih) - 32
+        const int sumi = ggml_cuda_dp4a(vi, u[i], 0);
+#endif
+        sumf += d8[i] * (sumi * sc); // SIMD dot product * scale
 
     }
 
@@ -999,14 +1032,12 @@ static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(
         const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
 
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid0 = __vsub4(grid_pos.x ^ signs0, signs0);
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, k0 + 0);
-        sumi = ggml_cuda_dp4a(grid0, u0, sumi);
+        sumi = dp4a_condneg(grid_pos.x, signs0, u0, sumi);
 
         const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid1 = __vsub4(grid_pos.y ^ signs1, signs1);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, k0 + 1);
-        sumi = ggml_cuda_dp4a(grid1, u1, sumi);
+        sumi = dp4a_condneg(grid_pos.y, signs1, u1, sumi);
     }
 
     const int ls = aux32 >> 27 | 1; // (scale * 2 + 1)
@@ -1036,19 +1067,17 @@ static __device__ __forceinline__ float vec_dot_iq2_xs_q8_1(
         const uint32_t signs = unpack_ksigns(q2[l0/2] >> 9);
 
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
 
         const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
 
         if (l0 < 4) {
-            sumi0 = ggml_cuda_dp4a(grid_l, u0, sumi0);
-            sumi0 = ggml_cuda_dp4a(grid_h, u1, sumi0);
+            sumi0 = dp4a_condneg(grid_pos.x, signs0, u0, sumi0);
+            sumi0 = dp4a_condneg(grid_pos.y, signs1, u1, sumi0);
         } else {
-            sumi1 = ggml_cuda_dp4a(grid_l, u0, sumi1);
-            sumi1 = ggml_cuda_dp4a(grid_h, u1, sumi1);
+            sumi1 = dp4a_condneg(grid_pos.x, signs0, u0, sumi1);
+            sumi1 = dp4a_condneg(grid_pos.y, signs1, u1, sumi1);
         }
     }
     const int sumi = (sumi0*ls0 + sumi1*ls1 + (sumi0 + sumi1)/2)/4;
@@ -1084,18 +1113,15 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
         const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
         const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
 
-        const int grid_l = __vsub4(grid_pos[0] ^ signs0, signs0);
-        const int grid_h = __vsub4(grid_pos[1] ^ signs1, signs1);
-
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
 
         if (l0 < 4) {
-            sumi0 = ggml_cuda_dp4a(grid_l, u0, sumi0);
-            sumi0 = ggml_cuda_dp4a(grid_h, u1, sumi0);
+            sumi0 = dp4a_condneg(grid_pos[0], signs0, u0, sumi0);
+            sumi0 = dp4a_condneg(grid_pos[1], signs1, u1, sumi0);
         } else {
-            sumi1 = ggml_cuda_dp4a(grid_l, u0, sumi1);
-            sumi1 = ggml_cuda_dp4a(grid_h, u1, sumi1);
+            sumi1 = dp4a_condneg(grid_pos[0], signs0, u0, sumi1);
+            sumi1 = dp4a_condneg(grid_pos[1], signs1, u1, sumi1);
         }
     }
     const int sumi = (sumi0*ls0 + sumi1*ls1 + (sumi0 + sumi1)/2)/4;
@@ -1123,17 +1149,13 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
         const uint32_t signs = unpack_ksigns(aux32 >> (7*l0/2));
 
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
-
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
 
         const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
-
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
 
-        sumi = ggml_cuda_dp4a(grid_l, u0, sumi);
-        sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
+        sumi = dp4a_condneg(grid_pos.x, signs0, u0, sumi);
+        sumi = dp4a_condneg(grid_pos.y, signs1, u1, sumi);
     }
 
     const int ls = aux32 >> 28;
@@ -1169,14 +1191,11 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
         const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
         const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
 
-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
-
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
 
-        sumi = ggml_cuda_dp4a(grid_l, u0, sumi);
-        sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
+        sumi = dp4a_condneg(grid_pos.x, signs0, u0, sumi);
+        sumi = dp4a_condneg(grid_pos.y, signs1, u1, sumi);
     }
 
     sumi *= 1 + 2*((bq3->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);

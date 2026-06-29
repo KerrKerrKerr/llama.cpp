@@ -292,6 +292,17 @@ static __device__ __forceinline__ unsigned int __vcmpeq4(unsigned int a, unsigne
 }
 
 static __device__ __forceinline__ unsigned int __vcmpne4(unsigned int a, unsigned int b) {
+#if defined(__gfx906__)
+    // Branchless SWAR per-byte not-equal mask (0xff where a != b, else 0x00).
+    // GCN5 has no packed byte compare, so avoid the 4-iteration scalar loop.
+    // The 0x80808080 OR guard keeps each byte >= 0x80 so the subtract cannot
+    // borrow across bytes; bit7 of s marks bytes whose low 7 bits were nonzero,
+    // and x's own high bit covers the 0x80 case.
+    const unsigned int x  = a ^ b;
+    const unsigned int s  = (x | 0x80808080) - 0x01010101;
+    const unsigned int nz = (s & 0x80808080) | (x & 0x80808080);
+    return (nz - (nz >> 7)) | nz; // 0x80 -> 0xff
+#else
     const uint8x4_t& va = reinterpret_cast<const uint8x4_t&>(a);
     const uint8x4_t& vb = reinterpret_cast<const uint8x4_t&>(b);
     unsigned int c;
@@ -301,4 +312,5 @@ static __device__ __forceinline__ unsigned int __vcmpne4(unsigned int a, unsigne
         vc[i] = va[i] == vb[i] ? 0x00 : 0xff;
     }
     return c;
+#endif // defined(__gfx906__)
 }
