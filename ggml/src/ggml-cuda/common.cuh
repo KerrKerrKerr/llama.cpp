@@ -21,6 +21,11 @@
 #endif
 #endif
 #include "ggml-common.h"
+#include "dpp.cuh"
+
+#if defined(__gfx906__) && defined(GGML_USE_HIP)
+#define expf gfx906_exp_f32
+#endif
 
 #include <array>
 #include <algorithm>
@@ -445,11 +450,15 @@ static __device__ __forceinline__ int warp_reduce_sum(int x) {
 
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ float warp_reduce_sum(float x) {
+#if defined(__gfx906__) && defined(GGML_USE_HIP)
+    return gfx906_warp_reduce_sum_f32<width>(x);
+#else
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
         x += __shfl_xor_sync(0xffffffff, x, offset, width);
     }
     return x;
+#endif
 }
 
 template<int width = WARP_SIZE>
