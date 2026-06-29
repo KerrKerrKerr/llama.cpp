@@ -468,18 +468,9 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmvq(
 
         const int vih = ((vh >> i) << 2) & 0x04040404;
 
-#if defined(__gfx906__)
-        // dp4a(vil - vih, u) == dp4a(vil, u) - dp4a(vih, u).
-        // vil bytes: 0..3, vih bytes: 0 or 4 -> result range -4..3, no saturation.
-        const int sumi = ggml_cuda_dp4a(vil, u[i], 0)
-                       - ggml_cuda_dp4a(vih, u[i], 0);
-#else
         const int vi = __vsubss4(vil, vih);
 
-        const int sumi = ggml_cuda_dp4a(vi, u[i], 0); // SIMD dot product
-#endif
-
-        sumf += d8[i] * (sumi * sc);
+        sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
     }
 
     return d3 * sumf;
@@ -644,20 +635,10 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
 
         const int vih = ((vh >> (4*i)) << 4) & 0x30303030;
 
-#if defined(__gfx906__)
-        // Replace __vsubss4 byte-wise subtract with a second sdot4 using:
-        //   dp4a(a - 32, u) == dp4a(a, u) - dp4a(0x20202020, u)
-        // vil | vih bytes are 0..63 (no saturation subtracting 32), so the
-        // identity is exact. Verified on hardware with a test kernel.
-        const int vip = vil | vih;
-        const int sumi = ggml_cuda_dp4a(vip, u[i], 0)
-                       - ggml_cuda_dp4a(0x20202020, u[i], 0);
-#else
         const int vi = __vsubss4((vil | vih), 0x20202020); // vi = (vil | vih) - 32
-        const int sumi = ggml_cuda_dp4a(vi, u[i], 0); // SIMD dot product
-#endif
 
-        sumf += d8[i] * (sumi * sc);
+        sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
+
     }
 
     return d*sumf;
